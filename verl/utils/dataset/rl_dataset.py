@@ -151,6 +151,27 @@ class RLHFDataset(Dataset):
         for i, parquet_file in enumerate(data_files):
             self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
 
+    @staticmethod
+    def _deserialize_json_columns(dataframe: datasets.Dataset) -> datasets.Dataset:
+        """Deserialize JSON string columns (reward_model, extra_info) to dicts at load time."""
+        import json
+
+        json_columns = [col for col in ("reward_model", "extra_info") if col in dataframe.column_names]
+        if not json_columns:
+            return dataframe
+
+        def _parse(example):
+            for col in json_columns:
+                val = example.get(col)
+                if isinstance(val, str):
+                    try:
+                        example[col] = json.loads(val)
+                    except (json.JSONDecodeError, TypeError):
+                        example[col] = {}
+            return example
+
+        return dataframe.map(_parse)
+
     def _read_files_and_tokenize(self):
         dataframes = []
         for parquet_file in self.data_files:
@@ -312,7 +333,13 @@ class RLHFDataset(Dataset):
         Returns:
             messages: List of messages with replaced placeholder.
         """
-        messages: list = example[self.prompt_key]
+        messages = example[self.prompt_key]
+        # Some parquet files store the prompt as a JSON string instead of a
+        # native Arrow list.  Parse it so downstream code always sees a list
+        # of message dicts.
+        if isinstance(messages, str):
+            import json
+            messages = json.loads(messages)
         # When concatenating image and video datasets, pop will return None for image or video sample
         images = example.pop(self.image_key, None) or []
         videos = example.pop(self.video_key, None) or []
@@ -364,6 +391,15 @@ class RLHFDataset(Dataset):
         # TODO(wuxibin): We still need a dummy tensor to make sure DataProto.batch is not empty.
         # Remove this after deprecate DataProto by TensorDict.
         row_dict["dummy_tensor"] = torch.tensor([0], dtype=torch.uint8)
+
+        # Deserialize JSON string fields from parquet
+        import json
+        for key in ("extra_info", "reward_model"):
+            if key in row_dict and isinstance(row_dict[key], str):
+                try:
+                    row_dict[key] = json.loads(row_dict[key])
+                except (json.JSONDecodeError, TypeError):
+                    row_dict[key] = dict()
 
         # add index for each prompt
         if "extra_info" not in row_dict or row_dict["extra_info"] is None:

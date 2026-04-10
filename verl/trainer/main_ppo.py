@@ -17,6 +17,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
+from typing import Any, cast
 
 import hydra
 import ray
@@ -75,7 +76,7 @@ def run_ppo(config, task_runner_class=None) -> None:
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray.init(**cast(dict[str, Any], OmegaConf.to_container(ray_init_kwargs, resolve=True)))
 
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
@@ -94,10 +95,10 @@ def run_ppo(config, task_runner_class=None) -> None:
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
-        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+        runner = cast(Any, task_runner_class).options(runtime_env={"nsight": nsight_options}).remote()
     else:
-        runner = task_runner_class.remote()
-    ray.get(runner.run.remote(config))
+        runner = cast(Any, task_runner_class).remote()
+    ray.get(cast(Any, runner).run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis
@@ -411,7 +412,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     dataset_cls = get_dataset_class(data_config)
 
     # Instantiate the dataset using the determined dataset class
-    dataset = dataset_cls(
+    dataset = cast(Any, dataset_cls)(
         data_files=data_paths,
         tokenizer=tokenizer,
         processor=processor,

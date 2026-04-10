@@ -97,6 +97,12 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    # ASPO (Archer) parameters — only used when loss_mode="aspo"
+    aspo_entropy_quantile: float = 0.8
+    aspo_low_entropy_clip_ratio_low: float = 0.2
+    aspo_low_entropy_clip_ratio_high: float = 0.2
+    aspo_high_entropy_clip_ratio_low: float = 0.4
+    aspo_high_entropy_clip_ratio_high: float = 0.4
 
 
 @dataclass

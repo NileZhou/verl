@@ -443,7 +443,16 @@ class RayPPOTrainer:
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-            sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+            def _get_gt(item):
+                rm = item.non_tensor_batch.get("reward_model", {})
+                if isinstance(rm, str):
+                    import json
+                    try:
+                        rm = json.loads(rm)
+                    except (json.JSONDecodeError, TypeError):
+                        rm = {}
+                return rm.get("ground_truth", None) if isinstance(rm, dict) else None
+            sample_gts = [_get_gt(item) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             if "request_id" in batch.non_tensor_batch:
@@ -531,6 +540,7 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        val_response_lengths = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -545,9 +555,16 @@ class RayPPOTrainer:
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
+            ground_truths = []
+            for item in test_batch:
+                rm = item.non_tensor_batch.get("reward_model", {})
+                if isinstance(rm, str):
+                    import json
+                    try:
+                        rm = json.loads(rm)
+                    except (json.JSONDecodeError, TypeError):
+                        rm = {}
+                ground_truths.append(rm.get("ground_truth", None) if isinstance(rm, dict) else None)
             sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
@@ -588,6 +605,11 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+
+            # Collect val response lengths
+            _max_resp_len = test_batch.batch["responses"].shape[-1]
+            _resp_mask = test_batch.batch["attention_mask"][:, -_max_resp_len:]
+            val_response_lengths.extend(_resp_mask.sum(-1).cpu().tolist())
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
@@ -641,9 +663,19 @@ class RayPPOTrainer:
                 "sample_uids": sample_uids,
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
+                "val_response_lengths": val_response_lengths,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        if val_response_lengths:
+            max_response_length = self.config.data.max_response_length
+            metric_dict['val_response_length/max'] = max(val_response_lengths)
+            metric_dict['val_response_length/mean'] = sum(val_response_lengths) / len(val_response_lengths)
+            metric_dict['val_response_length/min'] = min(val_response_lengths)
+            metric_dict['val_response_length/clip_ratio'] = sum(
+                1 for x in val_response_lengths if x == max_response_length
+            ) / len(val_response_lengths)
+        return metric_dict
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -694,7 +726,18 @@ class RayPPOTrainer:
             list_b = result_b["reward_extra_infos_dict"].get(key, [])
             reward_extra_infos_dict[key] = list_a + list_b
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        val_response_lengths = result_a.get("val_response_lengths", []) + result_b.get("val_response_lengths", [])
+
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        if val_response_lengths:
+            max_response_length = self.config.data.max_response_length
+            metric_dict['val_response_length/max'] = max(val_response_lengths)
+            metric_dict['val_response_length/mean'] = sum(val_response_lengths) / len(val_response_lengths)
+            metric_dict['val_response_length/min'] = min(val_response_lengths)
+            metric_dict['val_response_length/clip_ratio'] = sum(
+                1 for x in val_response_lengths if x == max_response_length
+            ) / len(val_response_lengths)
+        return metric_dict
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1224,7 +1267,7 @@ class RayPPOTrainer:
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
-            calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0 or self.config.actor_rollout_ref.actor.calculate_entropy
             distillation_use_topk = (
                 self.distillation_config.distillation_loss.loss_settings.use_topk
                 if is_distillation_enabled(self.config.get("distillation"))

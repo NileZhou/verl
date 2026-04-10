@@ -1,0 +1,34 @@
+{
+  "base_url": "http://wandb.wml.weibo.com",
+  "entity": "zy9",
+  "project": "s_3b_old_baseline_stage1",
+  "runs": [
+    "s_run_3b_rl_code16k_0.125-0.875_offpolicy_no-uly",
+    "s_run_3b_rl_code24k_0.125-0.875_offpolicy_no-uly_c3",
+    "s_run_3b_rl_code24k_0.125-0.875_offpolicy_no-uly_c6",
+    "run_my_dapo_offpolicy_mini_c3_latest",
+    "run_my_dapo_offpolicy_mini_c6_latest"
+  ],
+  "focused_metrics": [
+    "_step",
+    "_runtime",
+    "_timestamp",
+    "val-core/livecodebench/acc/best@4/mean",
+    "val-core/livecodebench/acc/mean@4",
+    "val_response_length/clip_ratio",
+    "response_length/clip_ratio",
+    "actor/entropy",
+    "actor/grad_norm",
+    "perf/throughput",
+    "perf/time_per_step",
+    "perf/mfu/actor",
+    "train/num_gen_batches",
+    "batch/valid",
+    "batch/solve_none",
+    "batch/solve_all",
+    "batch/all_correct_filtered",
+    "batch/all_incorrect_regenerate",
+    "batch/mixed_kept",
+    "batch/all_incorrect_filtered_max_reached"
+  ]
+}

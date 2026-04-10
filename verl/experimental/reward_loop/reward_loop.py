@@ -73,6 +73,14 @@ def migrate_legacy_reward_impl(config):
     if config.reward_model.get("reward_kwargs") is not None:
         with open_dict(config.reward):
             config.reward["reward_kwargs"] = config.reward_model["reward_kwargs"]
+    # config.reward_model.overlong_buffer -> config.reward.reward_kwargs.overlong_buffer_cfg
+    if config.reward_model.get("overlong_buffer") is not None:
+        overlong = config.reward_model.overlong_buffer
+        if not all(v is None for v in overlong.values()):
+            with open_dict(config.reward):
+                if "reward_kwargs" not in config.reward:
+                    config.reward["reward_kwargs"] = {}
+                config.reward.reward_kwargs["overlong_buffer_cfg"] = overlong
     # config.reward_model.rollout -> config.reward.reward_model.rollout
     legacy_rollout = config.reward_model.rollout
     for key in legacy_rollout.keys():
@@ -119,6 +127,15 @@ class RewardLoopWorker:
         self.reward_router_address = reward_router_address
         self._init_reward_fn()
         self.loop = get_event_loop()
+        raw_max_concurrent_scores = os.getenv("VERL_REWARD_LOOP_MAX_CONCURRENCY")
+        self.max_concurrent_scores = (
+            int(raw_max_concurrent_scores) if raw_max_concurrent_scores is not None else None
+        )
+        self._score_semaphore = (
+            asyncio.Semaphore(self.max_concurrent_scores)
+            if self.max_concurrent_scores is not None and self.max_concurrent_scores > 0
+            else None
+        )
 
     def _init_reward_fn(self):
         input_tokenizer_path = self.config.actor_rollout_ref.model.tokenizer_path
@@ -147,16 +164,29 @@ class RewardLoopWorker:
 
     async def compute_score(self, data: DataProto) -> dict:
         assert len(data) == 1, "RewardLoopWorker only support single data item"
-        if self.config.reward.custom_reward_function.path is not None:
-            # directly use user-customized reward function
-            return await self.reward_manager.run_single(data)
-        else:
-            if self.config.reward.reward_model.enable:
-                # we assume the rm is disrm
-                # genrm must set custom_reward_function
-                return await self.compute_score_disrm(data)
-            else:
+        if self._score_semaphore is None:
+            if self.config.reward.custom_reward_function.path is not None:
+                # directly use user-customized reward function
                 return await self.reward_manager.run_single(data)
+            else:
+                if self.config.reward.reward_model.enable:
+                    # we assume the rm is disrm
+                    # genrm must set custom_reward_function
+                    return await self.compute_score_disrm(data)
+                else:
+                    return await self.reward_manager.run_single(data)
+
+        async with self._score_semaphore:
+            if self.config.reward.custom_reward_function.path is not None:
+                # directly use user-customized reward function
+                return await self.reward_manager.run_single(data)
+            else:
+                if self.config.reward.reward_model.enable:
+                    # we assume the rm is disrm
+                    # genrm must set custom_reward_function
+                    return await self.compute_score_disrm(data)
+                else:
+                    return await self.reward_manager.run_single(data)
 
     async def _post_request(self, payload: dict, endpoint: str, max_retries: int = 16):
         url = f"http://{self.reward_router_address}/{endpoint}"

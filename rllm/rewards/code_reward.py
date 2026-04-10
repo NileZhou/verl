@@ -1,0 +1,767 @@
+"""
+This module contains the RewardCode class, which evaluates code datasets answers
+and assigns rewards based on their correctness on unit tests.
+"""
+import json
+import multiprocessing
+import re
+import time
+from multiprocessing import Manager
+from typing import Any, Dict, List, Union, cast
+import random
+import ast 
+import subprocess
+from tempfile import TemporaryDirectory
+import os
+import sys
+
+#from rllm.rewards.code_utils.code_contests import run_test as code_contests_run_test
+from rllm.rewards.code_utils.livecodebench import run_test as lcb_run_test
+from rllm.rewards.code_utils.codeforces import run_test as codeforces_run_test
+#from rllm.rewards.code_utils.swebench import swebench_check_correctness
+from rllm.rewards.code_utils.humanevalplus import run_test as humanevalplus_run_test, get_num_test_cases
+from rllm.rewards.code_utils.taco import run_test as taco_run_test
+from rllm.rewards.code_utils.firejail_exec import code_exec_firejail as lc_code_exec
+from rllm.rewards.code_utils.kodcode import code_exec as kod_code_exec
+from rllm.rewards.code_utils.opencodeinstruct import oci_run_assert_tests
+from rllm.rewards.reward_types import RewardConfig, RewardFn, RewardInput, RewardOutput, RewardType
+
+TestCase = Dict[str, Any]
+StructuredTests = List[TestCase]
+IOTests = Dict[str, List[str]]
+
+
+def extract_code_from_model(model_response: str) -> str | None:
+    """
+    Extracts the code from a Markdown-style code block in an LLM output.
+
+    Parameters:
+        model_response (str): The text output from the LLM.
+
+    Returns:
+        str: The extracted code, or an empty string if no code block is found.
+    """
+    code_blocks = re.findall(r"```(?:\w+)?\n(.*?)```", model_response, re.DOTALL)
+    if not code_blocks:
+        return None
+    return code_blocks[-1].strip()
+
+    # code_blocks = re.findall(r"```(?:\w+)?\n(.*?)```", model_response, re.DOTALL)
+    # if not code_blocks:
+    #     return None
+    
+    # for code_block in code_blocks[::-1]: # 从末尾往前数code block
+    #     if "def " in code_block:
+    #         return code_block.strip()
+    
+    # return code_blocks[-1].strip()
+
+
+def clean_code_main_block(code: str) -> str:
+    """
+    Removes `if __name__ == "__main__"` blocks from Python code.
+
+    Args:
+        code (str): The input Python code.
+
+    Returns:
+        str: Cleaned code without the main execution block.
+    """
+    code_lines = code.split('\n')
+    filtered_lines = []
+    skip_block = False
+
+    for line in code_lines:
+        if line.strip().startswith('if __name__ == "__main__"') or line.strip().startswith("if __name__ == '__main__'"):
+            skip_block = True
+            continue
+        if skip_block:
+            # Check if we're out of the block (less indentation)
+            if line.strip() and not line.startswith(' ') and not line.startswith('\t'):
+                skip_block = False
+            else:
+                continue
+        filtered_lines.append(line)
+
+    return '\n'.join(filtered_lines)
+
+
+def check_correctness(
+    tests: Union[StructuredTests, IOTests],
+    code: str,
+    test_fn,
+    timeout_per_test: int = 5,
+    max_tests: int = 150,
+) -> bool:
+    """
+    Check if generated code passes all test cases within a timeout period.
+
+    Args:
+        tests: Test cases in either list of dictionaries or dictionary of lists format
+        code: Generated code to test
+        test_fn: Function to run tests
+        timeout: Maximum execution time in seconds before killing process
+
+    Returns:
+        bool: True if all tests pass, False otherwise
+
+    Raises:
+        AssertionError: If test results list is empty
+    """
+    manager = Manager()
+    test_results = manager.list()
+    def evaluate_code(tests, generation, debug, test_results, test_fn):
+        """Helper function to run tests in separate process."""
+        try:
+            test_results.append(test_fn(tests, test=generation, debug=debug, timeout=timeout_per_test))
+        except Exception as e:
+            print(f"Error in evaluate_code: {e}")
+    if isinstance(tests, list):
+        tests_list = cast(StructuredTests, tests)
+        total_tests = len(tests_list)
+        if total_tests > max_tests:
+            # Sort indices by test input length and take the max_tests longest ones
+            selected_indices = sorted(range(total_tests), key=lambda i: len(str(tests_list[i]["input"])), reverse=True)[:max_tests]
+            tests_list = [tests_list[i] for i in selected_indices]
+        tests = tests_list
+    else:
+        tests_dict = cast(IOTests, tests)
+        total_tests = len(tests_dict['inputs'])
+        if total_tests > max_tests:
+            # Select the tests with the longest input length.
+            selected_indices = sorted(range(total_tests), key=lambda i: len(tests_dict['inputs'][i]), reverse=True)[:max_tests]
+            # Create a new dict with only the selected test cases
+            selected_tests = {
+                'inputs': [tests_dict['inputs'][i] for i in selected_indices],
+                'outputs': [tests_dict['outputs'][i] for i in selected_indices]
+            }
+            tests = selected_tests
+    
+    process = multiprocessing.Process(
+        target=evaluate_code,
+        args=(tests, code, False, test_results, test_fn)
+    )
+    process.start()
+    process.join()
+
+    if process.is_alive():
+        process.kill()
+    test_results = test_results[:]
+    if len(test_results) == 0:
+        return False
+    #assert len(test_results) == 1, f"Expected exactly one test result, but got {test_results}"
+    test_results = test_results[0]
+    test_results = [r==True for r in test_results]
+    return all(test_results)
+
+
+def oci_check_correctness(tests: object, code: str, timeout_per_test: int = 5, max_tests: int = 150) -> bool:
+    """
+    Check if generated code passes all OCI assert-based test cases.
+    
+    Args:
+        tests: JSON string containing a list of assert statements
+        code: Generated code to test
+        timeout_per_test: Maximum execution time per test in seconds
+        max_tests: Maximum number of tests to run
+        
+    Returns:
+        bool: True if all tests pass, False otherwise
+    """
+    try:
+        if isinstance(tests, str):
+            test_statements = json.loads(tests)
+        else:
+            test_statements = tests
+            
+        if not isinstance(test_statements, list):
+            print(f"Expected list of test statements, got {type(test_statements)}")
+            return False
+        if not all(isinstance(statement, str) for statement in test_statements):
+            print("Expected all OCI test statements to be strings")
+            return False
+        test_statements = cast(List[str], test_statements)
+            
+        if len(test_statements) == 0:
+            print("No test statements found")
+            return False
+            
+        # Limit the number of tests if needed
+        if len(test_statements) > max_tests:
+            # Select the first max_tests statements
+            test_statements = test_statements[:max_tests]
+            
+        # Clean up the code by removing main block if present
+        code = clean_code_main_block(code)
+        
+        return oci_run_assert_tests(test_statements, code, timeout_per_test)
+        
+    except json.JSONDecodeError as e:
+        print(f"Error parsing test JSON: {e}")
+        return False
+    except Exception as e:
+        print(f"Error in oci_check_correctness: {e}")
+        return False
+
+# todo timeout_per_test改回5
+def am_distill_r1_check_correctness(tests_str: object, code: str, timeout_per_test: int = 5, max_tests: int = 15) -> bool:  
+    if not isinstance(tests_str, str):
+        print(f"Expected string tests for am, got {type(tests_str)}")
+        return False
+    tests = json.loads(tests_str)
+    if isinstance(tests, str):
+        tests = json.loads(tests)
+    
+    def transfer_dict(d: Dict):
+        if d['call_type'] != 'assert':
+            return d
+        inputs = []
+        outputs = []
+        fn_name = d['fn_name']
+        for assert_case in d['assert_case']:
+            # 解析assert语句，提取输入和输出
+            try:
+                # 移除assert关键字
+                expr = assert_case.strip().replace('assert ', '')
+                # 使用正则表达式匹配函数调用和期望输出
+                # 匹配格式: function_name(args) == expected_output
+                pattern = rf'{re.escape(fn_name)}\((.*?)\)\s*==\s*(.+)'
+                match = re.match(pattern, expr)
+                if match:
+                    args_str = match.group(1).strip()
+                    expected_output_str = match.group(2).strip()
+                    # 安全地评估输入参数
+                    try:
+                        # 对于简单的参数，直接eval
+                        input_value = ast.literal_eval(args_str)
+                        if isinstance(input_value, tuple):
+                            inputs.append('\n'.join([f'"{word}"' if isinstance(word, str) else json.dumps(word) for word in input_value]))
+                        else:
+                            inputs.append(json.dumps(input_value))
+                    except:
+                        # 如果eval失败，保持原字符串
+                        inputs.append(args_str)
+                    # 安全地评估期望输出
+                    try:
+                        output_value = ast.literal_eval(expected_output_str)
+                        outputs.append(json.dumps(output_value))
+                    except:
+                        # 如果eval失败，保持原字符串
+                        outputs.append(expected_output_str)
+                else:
+                    # 如果正则匹配失败，尝试其他解析方法
+                    # 处理其他可能的assert格式
+                    inputs.append(assert_case)
+                    outputs.append(None)
+            except Exception as e:
+                print(f"Error parsing assert case: {assert_case}, error: {e}")
+                inputs.append(assert_case)
+                outputs.append(None)
+        return {
+            "call_type": "functional",
+            "fn_name": fn_name,
+            "inputs": inputs,
+            "outputs": outputs
+        }
+    
+    # tests = json.loads(tests_str)
+    tests = transfer_dict(tests)
+    # 转换格式，每个单测为一个dict,包含 'input' 和 'output' 这两个key
+    tests = [{'input': input_sample, 'output': output_sample, 'testtype': tests['call_type'], 'metadata': {'func_name': tests.get('fn_name', None)}} for input_sample, output_sample in zip(tests['inputs'], tests['outputs'])]
+
+    return lcb_check_correctness_v3(tests, code, timeout=timeout_per_test, debug=False)
+
+
+def postprocess_lcb_sample(samples: object) -> Dict[str, str]:
+    samples_list = cast(List[TestCase | str], samples)
+    for i in range(len(samples_list)):
+        sam = samples_list[i]
+        if isinstance(sam, str) and sam.strip().startswith("{"):
+            try:
+                samples_list[i] = json.loads(sam)
+                print(f'convert sample: {samples_list[i]} to dict')
+            except json.JSONDecodeError:
+                pass
+        
+    parsed_samples = cast(StructuredTests, samples_list)
+    sample_inputs = [sample['input'] for sample in parsed_samples]
+    sample_outputs = [sample['output'] for sample in parsed_samples]
+    
+    sample_dict = {
+        'inputs': sample_inputs,
+        'outputs': sample_outputs,
+    }
+    
+    first_sample = parsed_samples[0]
+    if first_sample.get("testtype") == "functional":
+        metadata = first_sample.get("metadata", {})
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        fn_name = metadata.get("func_name", None)
+        assert fn_name is not None, f"Function name is not found, check if your LCB data is preprocessed correctly: {metadata}"
+        # Fill in the blank
+        sample_dict['fn_name'] = fn_name
+    
+    sample = {
+        'input_output': json.dumps(sample_dict),
+    }
+    return sample
+
+# https://huggingface.co/datasets/PrimeIntellect/verifiable-coding-problems
+def primeintellect_check_correctness(tests: object, code: str) -> bool:
+    if isinstance(tests, str):
+        try:
+            tests =  ast.literal_eval(tests)
+            assert isinstance(tests, dict)
+        except (ValueError, SyntaxError) as e:
+            print(f"Error parsing string: {e}")
+            return False
+
+    tests_list = cast(StructuredTests, tests)
+    assert len(tests_list) >= 1, "PrimeIntellect needs at least one test case"
+    # Convert the tests to the format expected by the taco_run_test function
+    inputs = [t['input'] for t in tests_list]
+    outputs = [t['output'] for t in tests_list]
+    fn_name = tests_list[0].get('fn_name', None)
+    tests = {
+        'inputs': inputs,
+        'outputs': outputs,
+    }
+    if fn_name:
+        tests['fn_name'] = fn_name
+    return check_correctness(tests, code, taco_run_test)
+
+def lcb_check_correctness_v2(sample, generation, timeout=20, debug=False):
+    """某道题维度，针对多个单测的多进程校验，没法在外面套多进程"""
+    if isinstance(sample, str) and sample.strip().startswith("["):
+        sample = json.loads(sample)
+
+    assert len(sample) >= 1, "Sample must contain at least one test case"
+    sample = postprocess_lcb_sample(sample)
+
+    manager = multiprocessing.Manager()
+    result = manager.list()
+    metadata_list = manager.list()
+
+    def _temp_run(sample, generation, debug, result, metadata_list, timeout):
+        run_result = lcb_run_test(sample, code=generation, debug=debug, timeout=timeout)
+        if run_result is None:
+            return
+        res, metadata = run_result
+        result.append(res)
+        metadata_list.append(metadata)
+
+    p = multiprocessing.Process(
+        target=_temp_run,
+        args=(sample, generation, debug, result, metadata_list, timeout),
+    )
+    p.start()
+    p.join(
+        timeout=(timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5
+    )
+    if p.is_alive():
+        p.kill()
+    if not result:
+        in_outs = json.loads(sample["input_output"])
+        # consider that all tests failed
+        result = [[-1 for i in range(len(in_outs["inputs"]))]]
+        if debug:
+            print(f"global timeout")
+    if not result:
+        return False
+    # print(result[0], metadata_list)
+    # Check if all elements in result[0] are True
+    return all(x == True for x in result[0])
+
+def lcb_check_correctness_v3(sample, generation, timeout=5, debug=False):
+    """
+    单测维度，单进程校验，可在外套多进程
+    """
+    if isinstance(sample, str) and sample.strip().startswith("["):
+        sample = json.loads(sample)
+    assert len(sample) >= 1, "Sample must contain at least one test case"
+    sample = postprocess_lcb_sample(sample)
+
+    global_timeout = (timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5
+
+    with TemporaryDirectory() as tmpdir:
+        # Prepare data for the subprocess
+        input_data = {
+            "sample": sample,
+            "generation": generation,
+            "timeout": timeout,
+            "debug": debug,
+        }
+        input_path = os.path.join(tmpdir, "input.json")
+        with open(input_path, "w") as f:
+            json.dump(input_data, f)
+
+        # This script will be run in a separate process
+        runner_script = """
+import json
+import sys
+import os
+from rllm.rewards.code_utils.livecodebench import run_test as lcb_run_test
+
+def main():
+    input_path = sys.argv[1]
+    with open(input_path, 'r') as f:
+        data = json.load(f)
+    
+    res, _ = lcb_run_test(
+        data['sample'], 
+        code=data['generation'], 
+        debug=data['debug'], 
+        timeout=data['timeout']
+    )
+    
+    # We only care about the results, not metadata
+    print(json.dumps({'result': [r == True for r in res]}))
+
+if __name__ == "__main__":
+    main()
+"""
+        script_path = os.path.join(tmpdir, "runner.py")
+        with open(script_path, "w") as f:
+            f.write(runner_script)
+        
+        # Set up environment for subprocess
+        env = os.environ.copy()
+        # The project root is two directories up from the rllm module's path
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))) # verl root
+        if 'PYTHONPATH' not in env:
+            env['PYTHONPATH'] = project_root
+        else:
+            env['PYTHONPATH'] = f"{project_root}:{env['PYTHONPATH']}"
+
+        try:
+            command = [sys.executable, script_path, input_path] # 之前的解释器
+            process = subprocess.run(
+                command,
+                timeout=global_timeout,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            
+            if process.returncode == 0 and process.stdout:
+                last = process.stdout.strip().splitlines()[-1].strip().strip("'")
+                data = json.loads(last) 
+                return all(data['result'])
+            
+            if debug and process.returncode != 0:
+                print(f"Subprocess for lcb_check_correctness_v3 failed with return code {process.returncode}")
+                print(f"Stderr: {process.stderr}")
+            return False
+
+        except subprocess.TimeoutExpired:
+            if debug:
+                print(f"Global timeout of {global_timeout}s expired for lcb_check_correctness_v3.")
+            return False
+        except Exception as e:
+            if debug:
+                print(f"An exception occurred in lcb_check_correctness_v3: {e}")
+            return False
+
+
+def leetcode_check_correctness(tests: object, code: str) -> bool:
+     """
+     Check if generated code passes all LeetCode test cases.
+    
+     Args:
+          tests: List of test cases, each containing input/output pairs
+          code: Generated code to test
+          timeout: Maximum execution time in seconds before killing process
+          runtime_debug: Whether to print debug info during test execution
+    
+     Returns:
+          bool: True if all tests pass and result list exists, False otherwise
+     """
+     if not isinstance(tests, dict):
+         print(f"Expected dict tests for leetcode, got {type(tests)}")
+         return False
+     functional_test = tests.get("functional")
+     if not isinstance(functional_test, str):
+         print("Missing functional test for leetcode")
+         return False
+     succ, output = lc_code_exec(code + '\n' + functional_test)
+     if not succ:
+         print(f"Error in code execution: {output}")
+     return succ
+
+def kodcode_check_correctness(test: object, code: str, timeout_per_test: int = 5) -> bool:
+    """
+    Check if generated code passes all Kodcode test cases.
+    
+    Args:
+        test: String of the test file content
+        code: Generated code to test
+        timeout: Maximum execution time in seconds before killing process
+        runtime_debug: Whether to print debug info during test execution
+    
+    Returns:
+        bool: True if all tests pass and result list exists, False otherwise
+    """
+    if not isinstance(test, str):
+        print(f"Expected string tests for kodcode, got {type(test)}")
+        return False
+
+    # Count the number of test functions in the test file
+    num_tests = test.count('def test')
+
+    # Remove 'if __name__ == "__main__":' block if present
+    code = clean_code_main_block(code)
+    
+    succ, output = kod_code_exec(code, test, timeout_per_test * num_tests)
+    if not succ:
+        print(f"Error in code execution: {output}")
+    return succ
+
+def humanevalplus_check_correctness(test: object, code: str, timeout_per_test: int = 1) -> bool:
+    """
+    Check if generated code passes all HumanEvalPlus test cases.
+    
+    Args:
+        test: String of the test file content
+        code: Generated code to test
+        timeout: Maximum execution time in seconds before killing process
+        runtime_debug: Whether to print debug info during test execution
+    
+    Returns:
+        bool: True if all tests pass and result list exists, False otherwise
+    """
+    if not isinstance(test, str):
+        print(f"Expected string tests for humanevalplus, got {type(test)}")
+        return False
+
+    code = clean_code_main_block(code)
+
+    num_test_cases = get_num_test_cases(test)
+    if not isinstance(num_test_cases, int):
+        print(f"Failed to infer humanevalplus test count: {num_test_cases}")
+        return False
+    succ, output = humanevalplus_run_test(code, test, timeout_per_test * num_test_cases)
+    if not succ:
+        print(f"Error in code execution: {output}")
+    return succ
+
+class RewardCodeFn(RewardFn):
+    """
+    Reward function for evaluating code dataset answers.
+
+    This class implements the __call__ method to process the input and determine
+    the reward based on the correctness of the unit tests provided
+    """
+    def __call__(self, input: RewardInput) -> RewardOutput:
+        total_start_time = time.time()
+
+        assert input.problem_type == RewardType.CODE, \
+            "Invalid problem type: expected 'CODE', but got '{}'".format(input.problem_type)
+
+        model_response = input.model_response
+        metadata = input.metadata
+        
+        dataset_name = input.data_source
+        tests = metadata
+        if tests is None:
+            print("No tests found in metadata")
+            return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
+
+        model_code = extract_code_from_model(model_response)
+        if model_code is None:
+            # print("No code found in model response")
+            return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
+
+        # Tests: List[Dictionary] - Codeforces, LiveCodeBench
+        # Tests: Dictionary[Lists] - CodeContests, Taco/Apps
+        is_correct = False
+        if dataset_name in ["taco", "apps", "code_contests"]:
+            if not isinstance(tests, (list, dict)):
+                print(f"Unexpected tests type for {dataset_name}: {type(tests)}")
+                return RewardOutput(reward=self.config.incorrect_reward, is_correct=False)
+            test_fn = taco_run_test
+            is_correct = check_correctness(tests, model_code, test_fn)
+        elif dataset_name == "codeforces":
+            if not isinstance(tests, (list, dict)):
+                print(f"Unexpected tests type for {dataset_name}: {type(tests)}")
+                return RewardOutput(reward=self.config.incorrect_reward, is_correct=False)
+            test_fn = codeforces_run_test
+            is_correct = check_correctness(tests, model_code, test_fn)
+        elif dataset_name == "leetcode":
+            is_correct = leetcode_check_correctness(tests, model_code)
+        elif dataset_name == "livecodebench":
+            is_correct = lcb_check_correctness_v2(tests, model_code, debug=False)
+        elif dataset_name == "primeintellect":
+            is_correct = primeintellect_check_correctness(tests, model_code)
+        elif dataset_name == "kodcode":
+            is_correct = kodcode_check_correctness(tests, model_code)
+        elif dataset_name == "humanevalplus":
+            is_correct = humanevalplus_check_correctness(tests, model_code)
+        elif dataset_name == "am":
+            is_correct = am_distill_r1_check_correctness(tests, model_code)
+        elif dataset_name == "oci":
+            is_correct = oci_check_correctness(tests, model_code)
+        else:
+            raise ValueError(f"Unsupported code dataset: {dataset_name}")
+
+        total_time = time.time() - total_start_time
+        # print(f"Total reward function execution time: {total_time:.2f} seconds")
+
+        if is_correct:
+            return RewardOutput(reward=self.config.correct_reward, is_correct=True)
+        else:
+            return RewardOutput(reward=self.config.incorrect_reward, is_correct=False)
+
+def rllm_reward_fn_code(data_source: str, llm_solution: str, ground_truth: object, **kwargs):
+    """Evaluate code solutions against ground truth ansters
+    
+    This function creates a reward function to evaluate code solutions by pass the test_case from groun_truth. It can optionally use a language model
+    for more sophisticated answer validation.
+
+    Args:
+        data_source: The source/dataset the problem comes from
+        llm_solution: The solution string provided by the language model to evaluate
+        ground_truth: some tests for this llm_solution
+        enable_llm: Whether to enable language model validation for complex cases (default: False)
+
+    Returns:
+        bool: True if the solution passes all the test_case, False otherwise
+
+    Example:
+            model_response = '''
+import sys
+from itertools import permutations
+def main():
+    n,m=map(int, input().split()) 
+    a=sum(list(map(int, input().split()))) 
+    if a+(n-1)*10<=m: 
+        print(5) 
+    else: 
+        print(5)
+if __name__ == "__main__":
+    main()
+'''
+    
+    print(f"test the code_forces")
+    # tests = [ { "input": "3 30\n2 2 1", "output": "5" }, { "input": "3 10\n3 2 1", "output": "5" } ] 
+    metadata = {
+         "tests": tests,
+    }
+    True
+    """
+    reward_config = RewardConfig()
+    reward_fn = RewardCodeFn(reward_config)
+    try:
+        reward_response = reward_fn(
+            RewardInput(
+                problem=None,
+                problem_type=RewardType.CODE,
+                data_source=data_source,
+                model_response=llm_solution,
+                metadata=ground_truth
+            ))
+        return reward_response.is_correct
+    except Exception as e:
+        print(f"Error in reward function: {e}, data_source: {data_source}")
+        
+        # 留着用来debug
+        debug_dir = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(debug_dir, '1.txt'), 'w') as f:
+            json.dump(ground_truth, f, ensure_ascii=False)
+        with open(os.path.join(debug_dir, '1_gen.txt'), 'w') as f:
+            json.dump(llm_solution, f, ensure_ascii=False)
+        
+        raise e
+  
+  
+  
+if __name__ == '__main__':
+    # python -m rllm.rewards.code_reward
+    
+    def load_vpypy_dump(input_json_path: str, index: int = -1):
+        """
+        从 lcb_check_correctness_vpypy 持久化的 *_input.json 中加载数据，并直接调用 livecodebench 测试函数复现一次。
+        用法（示例）：
+            python -m rllm.rewards.code_reward load_vpypy /path/to/xxx_input.json
+        在调试器里也可以直接 import 并调用该函数。
+        """
+        # 优先按 JSONL 逐行解析；解析失败时再尝试单个 JSON
+        payloads = []
+        try:
+            with open(input_json_path, 'r') as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    payloads.append(json.loads(s))
+        except Exception:
+            payloads = []
+        if not payloads:
+            with open(input_json_path, 'r') as f:
+                payloads = [json.load(f)]
+
+        # 选择条目（默认最后一条）
+        if not payloads:
+            raise ValueError("Empty vpypy dump file")
+        payload = payloads[index]
+
+        # 兼容两种结构
+        if 'sample' in payload and 'generation' in payload:
+            data = payload
+        elif 'input' in payload and isinstance(payload['input'], dict):
+            data = payload['input']
+        else:
+            raise ValueError("Unrecognized vpypy dump format: expected top-level 'sample'/'generation' or 'input'.")
+
+        # 调用 lcb_check_correctness_v2，以完整复现当前 livecodebench 校验链路
+        sample = data['sample']
+        generation = data['generation']
+        timeout = data.get('timeout', 6)
+        debug_flag = data.get('debug', False)
+        is_correct = lcb_check_correctness_v2(sample, generation, timeout=timeout, debug=debug_flag)
+        print(json.dumps({'is_correct': is_correct}, ensure_ascii=False, indent=2))
+    
+    # CLI: debug loader
+    if len(sys.argv) >= 3 and sys.argv[1] == 'load_vpypy':
+        idx = int(sys.argv[3]) if len(sys.argv) >= 4 else -1
+        load_vpypy_dump(sys.argv[2], idx)
+        sys.exit(0)
+    
+    # def postprocess_lcb_sample(sample):
+    #     sample_inputs = [sample['input'] for sample in sample]
+    #     sample_outputs = [sample['output'] for sample in sample]
+        
+    #     sample_dict = {
+    #         'inputs': sample_inputs,
+    #         'outputs': sample_outputs,
+    #     }
+        
+    #     if sample[0].get("testtype") == "functional":
+    #         metadata = sample[0].get("metadata", {})
+    #         fn_name = metadata.get("func_name", None)
+    #         # import ipdb; ipdb.set_trace()
+    #         assert fn_name is not None, f"Function name is not found, check if your LCB data is preprocessed correctly: {metadata}"
+    #         # Fill in the blank
+    #         sample_dict['fn_name'] = fn_name
+    #         print(f'extract fn_name: {fn_name}\n\n')
+        
+    #     sample = {
+    #         'input_output': json.dumps(sample_dict),
+    #     }
+    #     return sample
+    
+    
+    # with open('/njfs/train-aitech/projects/zhouyi9/projects/coderl/verl/rllm/rewards/1_tests.txt', 'r') as f:
+    #     sample = json.load(f) 
+    #     sample = postprocess_lcb_sample(sample)
+    # # with open('/njfs/train-aitech/projects/zhouyi9/projects/coderl/verl/rllm/rewards/1_gen.txt', 'r') as f:
+    # #     generation = json.load(f)
+    # with open('/njfs/train-aitech/projects/zhouyi9/projects/coderl/verl/rllm/rewards/1_gen.txt', 'r') as f:
+    #     generation = f.read()
+    #     generation = extract_code_from_model(generation)
+    #     print(f'extract code: \n{generation}\n\n')
+
+    # ret = lcb_run_test(sample, code=generation, debug=False, timeout=6000)
+    # print(ret)
+

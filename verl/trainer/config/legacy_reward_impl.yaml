@@ -12,6 +12,11 @@ reward_model:
   reward_loop_source: null
   reward_loop_module_path: null
   reward_loop_class_name: null
+  overlong_buffer:
+    enable: null
+    len: null
+    penalty_factor: null
+  reward_kwargs: null
   model:
     path: null
     external_lib: null
