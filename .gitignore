@@ -67,7 +67,6 @@ output.txt
 *.pot
 
 # Django stuff:
-*.log
 local_settings.py
 
 # Flask stuff:
